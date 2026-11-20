@@ -1,0 +1,78 @@
+# Example — copy to .github/dependabot.yml on the default branch.
+#
+# At most three pull requests a week (Actions, Composer, npm), each merged
+# automatically once CI is green (see the auto-merge workflow).
+# Remove the composer or npm block if the repository has no composer.json or
+# package.json.
+#
+# Security updates are not configured here: they are enabled in the
+# repository's security settings. Neither `cooldown` nor the major `ignore`
+# below applies to them.
+
+version: 2
+
+# Private Composer repositories: uncomment, and add the matching Dependabot
+# secrets (Settings > Secrets and variables > Dependabot).
+#
+# registries:
+#   private-packages:
+#     type: composer-repository
+#     url: https://composer.example.com
+#     username: ${{ secrets.COMPOSER_USERNAME }}
+#     password: ${{ secrets.COMPOSER_PASSWORD }}
+
+updates:
+  # GitHub Actions — everything, majors included. Actions are pinned by major
+  # tag, so Dependabot proposes almost nothing but majors.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "10:00"
+      timezone: Europe/Paris
+    # Wait 3 days after a release before proposing it. This ecosystem only
+    # supports `default-days`.
+    cooldown:
+      default-days: 3
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Composer — minors and patches in one pull request, no majors.
+  - package-ecosystem: composer
+    directory: /
+    # registries: [private-packages]
+    schedule:
+      interval: weekly
+      day: monday
+      time: "10:00"
+      timezone: Europe/Paris
+    cooldown:
+      default-days: 3
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    # Keep minors and patches in ONE group: Dependabot always targets the
+    # latest allowed version, so a package with a pending minor never gets a
+    # separate patch pull request.
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  # npm — same rules as Composer.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "10:00"
+      timezone: Europe/Paris
+    cooldown:
+      default-days: 3
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]

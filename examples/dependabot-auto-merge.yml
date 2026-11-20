@@ -1,0 +1,20 @@
+# Caller file — copy to .github/workflows/dependabot-auto-merge.yml
+#
+# It holds no logic: it calls the shared workflow. See the requirements
+# (auto-merge allowed + a required status check) at the top of that workflow.
+
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    uses: SRWieZ/.github/.github/workflows/dependabot-auto-merge.yml@main
+    # with:
+    #   merge-method: squash   # squash (default), merge or rebase
+    #   allow-minor: false     # false = only merge patches
