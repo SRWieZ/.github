@@ -184,5 +184,18 @@ jobs:
           esac
 
           # 5. Merge, only if the pull request still points at the tested commit.
-          gh pr merge "$number" --repo "$REPO" "--$MERGE_METHOD" --match-head-commit "$HEAD_SHA"
-          echo "Merged #$number ($kind, $total checks green)." | tee -a "$GITHUB_STEP_SUMMARY"
+          #    A refusal is not an error when the pull request can no longer be
+          #    merged: another Dependabot pull request merged a moment ago can
+          #    leave this one in conflict, or already closed. Dependabot then
+          #    rebases or closes it itself.
+          if gh pr merge "$number" --repo "$REPO" "--$MERGE_METHOD" --match-head-commit "$HEAD_SHA"; then
+            echo "Merged #$number ($kind, $total checks green)." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          after=$(gh api "repos/$REPO/pulls/$number")
+          [ "$(jq -r '.state' <<<"$after")" = "open" ] || skip "#$number was closed or merged in the meantime."
+          [ "$(jq -r '.mergeable_state' <<<"$after")" != "dirty" ] || skip "#$number is in conflict with the base branch."
+
+          echo "The merge of #$number failed." >&2
+          exit 1
