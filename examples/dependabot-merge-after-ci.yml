@@ -1,0 +1,33 @@
+# Caller file — copy to .github/workflows/dependabot-merge-after-ci.yml
+#
+# For repositories where native auto-merge is not available. It holds no logic:
+# it calls the shared workflow when a CI workflow finishes.
+#
+# This file must be on the default branch: `workflow_run` always runs the
+# version found there.
+
+name: Dependabot merge after CI
+
+on:
+  workflow_run:
+    # The `name:` of EVERY CI workflow of this repository. A workflow that is
+    # not listed can finish last without triggering the merge.
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+jobs:
+  merge:
+    # Do not start anything for a failed run or a branch that is not Dependabot's.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+    uses: SRWieZ/.github/.github/workflows/dependabot-merge-after-ci.yml@main
+    # with:
+    #   merge-method: squash   # squash (default), merge or rebase
+    #   allow-minor: false     # false = only merge patches

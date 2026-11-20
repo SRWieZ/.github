@@ -1,0 +1,188 @@
+# ------------------------------------------------------------------------------
+# Merge Dependabot pull requests once CI has passed — shared, reusable workflow.
+#
+# Use this one where GitHub's native auto-merge and required status checks are
+# NOT available (private repositories on a free personal account). Where they
+# are available, prefer dependabot-auto-merge.yml: it is simpler.
+#
+# How it works: the caller is triggered by `workflow_run`, i.e. when a CI
+# workflow finishes. This workflow then checks the pull request and merges it
+# itself. Nothing runs when CI does not run, so: no CI, no merge.
+#
+# A pull request is merged only if ALL of this holds:
+#   - it is open, comes from a `dependabot/...` branch of this repository and
+#     was opened by Dependabot;
+#   - its head commit is the one CI just tested, is signed, and was authored by
+#     Dependabot (a commit pushed by someone else on the branch stops the merge);
+#   - every check run and commit status on that commit is green;
+#   - GitHub Actions updates: any version;
+#     other ecosystems: patches, and minors when `allow-minor` is true.
+#     Majors are never merged here.
+#
+# Anything else leaves the pull request open, with the reason in the job summary.
+#
+# Limits to know about:
+#   - the default branch is not protected: nothing prevents a manual merge of a
+#     red pull request;
+#   - the caller must list EVERY CI workflow of the repository by name. A
+#     workflow that is not listed can finish last without waking this one up;
+#   - the merge is made with GITHUB_TOKEN, so it does not trigger other
+#     workflows (a deployment done by a `push` workflow will not start).
+#     Deployments triggered by a webhook or a GitHub App are not affected;
+#   - CI started by Dependabot only sees Dependabot secrets, not Actions
+#     secrets (Settings > Secrets and variables > Dependabot).
+# ------------------------------------------------------------------------------
+
+name: Dependabot merge after CI
+
+on:
+  workflow_call:
+    inputs:
+      merge-method:
+        description: 'Merge method: squash, merge or rebase.'
+        type: string
+        default: squash
+      allow-minor:
+        description: 'Also merge minor updates (false = patches only).'
+        type: boolean
+        default: true
+
+# A called workflow cannot get more than its caller: the caller must declare
+# the same permissions.
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+
+    # Cheap filter, evaluated before a runner starts. The script below checks
+    # the rest.
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
+
+    # Several CI workflows can finish at the same moment: handle them one after
+    # the other so that only one of them merges.
+    concurrency:
+      group: dependabot-merge-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check the pull request and merge it
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
+          ALLOW_MINOR: ${{ inputs.allow-minor }}
+        run: |
+          set -euo pipefail
+
+          skip() {
+            echo "Not merged: $1" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+
+          case "$MERGE_METHOD" in
+            squash|merge|rebase) ;;
+            *) echo "Unknown merge method: $MERGE_METHOD" >&2; exit 1 ;;
+          esac
+
+          # 1. The pull request: open, same repository, opened by Dependabot,
+          #    still pointing at the commit CI tested.
+          pr=$(gh api -X GET "repos/$REPO/pulls" -f state=open -f head="$OWNER:$HEAD_BRANCH" --jq '.[0] // empty')
+          [ -n "$pr" ] || skip "no open pull request for $HEAD_BRANCH."
+
+          number=$(jq -r '.number' <<<"$pr")
+          author=$(jq -r '.user.login' <<<"$pr")
+          pr_sha=$(jq -r '.head.sha' <<<"$pr")
+
+          [ "$author" = "dependabot[bot]" ] || skip "#$number was opened by $author, not by Dependabot."
+          [ "$pr_sha" = "$HEAD_SHA" ] || skip "#$number has moved on since this CI run; its own run will decide."
+
+          # 2. The commit: authored by Dependabot and signed.
+          commit=$(gh api "repos/$REPO/commits/$HEAD_SHA")
+          commit_author=$(jq -r '.author.login // ""' <<<"$commit")
+          verified=$(jq -r '.commit.verification.verified' <<<"$commit")
+          message=$(jq -r '.commit.message' <<<"$commit")
+
+          [ "$commit_author" = "dependabot[bot]" ] || skip "the head commit of #$number was not authored by Dependabot."
+          [ "$verified" = "true" ] || skip "the head commit of #$number is not signed."
+
+          # 3. Every check on that commit is green. A check still running means
+          #    another CI workflow has not finished: its own completion will
+          #    trigger this workflow again.
+          runs=$(gh api --paginate "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" --jq '.check_runs[] | {name, status, conclusion}' | jq -s '.')
+          total=$(jq 'length' <<<"$runs")
+          pending=$(jq -r '[.[] | select(.status != "completed") | .name] | join(", ")' <<<"$runs")
+          failed=$(jq -r '[.[] | select(.status == "completed" and (.conclusion | IN("success", "neutral", "skipped") | not)) | .name] | join(", ")' <<<"$runs")
+
+          [ "$total" -gt 0 ] || skip "no check run on #$number."
+          [ -z "$pending" ] || skip "checks still running on #$number: $pending."
+          [ -z "$failed" ] || skip "checks not green on #$number: $failed."
+
+          status=$(gh api "repos/$REPO/commits/$HEAD_SHA/status")
+          if [ "$(jq -r '.total_count' <<<"$status")" -gt 0 ] && [ "$(jq -r '.state' <<<"$status")" != "success" ]; then
+            skip "commit statuses not green on #$number."
+          fi
+
+          # 4. The kind of update, read from the commit message Dependabot
+          #    writes. Version updates carry one `update-type` line per
+          #    dependency. Security updates do not: the level is then worked
+          #    out from the "from X to Y" versions of the message.
+          #    GitHub Actions updates are merged whatever the version.
+          level_of() {
+            local from=${1#v} to=${2#v} IFS=.
+            local -a a=($from) b=($to)
+            if ! [[ "${a[0]:-}" =~ ^[0-9]+$ && "${b[0]:-}" =~ ^[0-9]+$ ]]; then
+              echo unknown
+            elif [ "${a[0]}" != "${b[0]}" ]; then
+              echo major
+            elif [ "${a[1]:-0}" != "${b[1]:-0}" ]; then
+              echo minor
+            else
+              echo patch
+            fi
+          }
+
+          case "$HEAD_BRANCH" in
+            dependabot/github_actions/*)
+              kind="GitHub Actions update"
+              ;;
+            *)
+              deps=$(grep -cE '^- dependency-name: ' <<<"$message" || true)
+              levels=$(grep -oE 'update-type: version-update:semver-(major|minor|patch)' <<<"$message" | sed 's/.*semver-//' || true)
+              typed=$(grep -c . <<<"$levels" || true)
+
+              [ "$deps" -gt 0 ] || skip "no Dependabot metadata in the head commit of #$number."
+
+              if [ "$typed" -lt "$deps" ]; then
+                pairs=$(grep -E '^(Bumps|Updates) ' <<<"$message" | grep -oE 'from [^ ]+ to [^ ]+' | sed -E 's/^from ([^ ]+) to ([^ ]+)$/\1 \2/; s/\.$//' || true)
+                [ "$(grep -c . <<<"$pairs" || true)" -ge "$deps" ] || skip "versions not found for some dependencies of #$number."
+                levels=$(while read -r from to; do level_of "$from" "$to"; done <<<"$pairs")
+              fi
+
+              if grep -q 'unknown' <<<"$levels"; then
+                skip "#$number has a version that cannot be compared."
+              elif grep -q 'major' <<<"$levels"; then
+                skip "#$number contains a major update."
+              elif grep -q 'minor' <<<"$levels"; then
+                [ "$ALLOW_MINOR" = "true" ] || skip "#$number contains a minor update and allow-minor is false."
+                kind="minor update"
+              else
+                kind="patch update"
+              fi
+              ;;
+          esac
+
+          # 5. Merge, only if the pull request still points at the tested commit.
+          gh pr merge "$number" --repo "$REPO" "--$MERGE_METHOD" --match-head-commit "$HEAD_SHA"
+          echo "Merged #$number ($kind, $total checks green)." | tee -a "$GITHUB_STEP_SUMMARY"
