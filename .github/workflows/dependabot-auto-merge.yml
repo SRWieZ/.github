@@ -7,7 +7,8 @@
 # What gets merged automatically:
 #   - GitHub Actions: everything (patch, minor, major);
 #   - every other ecosystem: patches, and minors when `allow-minor` is true;
-#   - majors outside GitHub Actions are never merged here.
+#   - majors outside GitHub Actions are never merged here, nor minors below 1.0
+#     (0.5 to 0.8), which can break the API just as well.
 #
 # When: as soon as the pull request is opened and the required checks are
 # green. This workflow does not look at the clock; the `schedule` in the
@@ -62,6 +63,16 @@ jobs:
         id: metadata
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
 
+      # Below 1.0, a minor update can break the API too: Dependabot calls 0.5
+      # to 0.8 a minor, this workflow does not merge it.
+      - name: Look for 0.x minor updates
+        id: zero
+        env:
+          DEPENDENCIES: ${{ steps.metadata.outputs.updated-dependencies-json }}
+        run: |
+          minor=$(jq '[.[] | select(.updateType == "version-update:semver-minor" and ((.prevVersion // "") | test("^v?0\\.")))] | length > 0' <<<"$DEPENDENCIES")
+          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+
       # `update-type` is the HIGHEST level in the pull request: a grouped pull
       # request holding ten patches and one minor counts as "semver-minor".
       #
@@ -71,7 +82,8 @@ jobs:
         if: >-
           steps.metadata.outputs.package-ecosystem == 'github_actions' ||
           steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
-          (inputs.allow-minor && steps.metadata.outputs.update-type == 'version-update:semver-minor')
+          (inputs.allow-minor && steps.metadata.outputs.update-type == 'version-update:semver-minor' &&
+            steps.zero.outputs.minor == 'false')
         run: gh pr merge --auto "--$MERGE_METHOD" "$PR_URL"
         env:
           MERGE_METHOD: ${{ inputs.merge-method }}

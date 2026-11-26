@@ -17,7 +17,8 @@
 #   - every check run and commit status on that commit is green;
 #   - GitHub Actions updates: any version;
 #     other ecosystems: patches, and minors when `allow-minor` is true.
-#     Majors are never merged here.
+#     Majors are never merged here, nor minors below 1.0 (0.5 to 0.8), which
+#     can break the API just as well.
 #
 # Anything else leaves the pull request open, with the reason in the job summary.
 #
@@ -164,11 +165,17 @@ jobs:
 
               [ "$deps" -gt 0 ] || skip "no Dependabot metadata in the head commit of #$number."
 
+              pairs=$(grep -E '^(Bumps|Updates) ' <<<"$message" | grep -oE 'from [^ ]+ to [^ ]+' | sed -E 's/^from ([^ ]+) to ([^ ]+)$/\1 \2/; s/\.$//' || true)
               if [ "$typed" -lt "$deps" ]; then
-                pairs=$(grep -E '^(Bumps|Updates) ' <<<"$message" | grep -oE 'from [^ ]+ to [^ ]+' | sed -E 's/^from ([^ ]+) to ([^ ]+)$/\1 \2/; s/\.$//' || true)
                 [ "$(grep -c . <<<"$pairs" || true)" -ge "$deps" ] || skip "versions not found for some dependencies of #$number."
                 levels=$(while read -r from to; do level_of "$from" "$to"; done <<<"$pairs")
               fi
+
+              # Below 1.0, a minor update can break the API too: Dependabot
+              # calls 0.5 to 0.8 a minor, this workflow does not merge it.
+              while read -r from to; do
+                [ "$(level_of "$from" "$to")" != "minor" ] || [[ "${from#v}" != 0.* ]] || skip "#$number contains a 0.x minor update ($from to $to)."
+              done <<<"$pairs"
 
               if grep -q 'unknown' <<<"$levels"; then
                 skip "#$number has a version that cannot be compared."
